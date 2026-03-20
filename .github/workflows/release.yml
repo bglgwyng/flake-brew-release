@@ -1,0 +1,178 @@
+name: Nix Flake to Homebrew Release
+
+on:
+  workflow_call:
+    inputs:
+      binary-name:
+        description: "Name of the binary (defaults to repo name)"
+        required: false
+        type: string
+      tap-repo:
+        description: "Homebrew tap repository (e.g. owner/homebrew-tap)"
+        required: false
+        type: string
+      formula-name:
+        description: "Homebrew formula name (defaults to binary-name)"
+        required: false
+        type: string
+      description:
+        description: "Homebrew formula description"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      HOMEBREW_TAP_TOKEN:
+        description: "GitHub token with push access to the tap repository"
+        required: false
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            system: x86_64-linux
+          - os: macos-latest
+            system: aarch64-darwin
+          - os: macos-15
+            system: x86_64-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build
+        run: nix build .#packages.${{ matrix.system }}.default
+
+      - name: Package tarball
+        run: |
+          binary="${{ inputs.binary-name || github.event.repository.name }}"
+          tar -czvf "$binary-${{ matrix.system }}.tar.gz" -C result/bin .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.system }}
+          path: "*.tar.gz"
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          for dir in artifacts/*/; do
+            cp "$dir"*.tar.gz release/
+          done
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+
+  homebrew:
+    if: ${{ inputs.tap-repo != '' }}
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get version and names
+        id: meta
+        run: |
+          echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          binary="${{ inputs.binary-name || github.event.repository.name }}"
+          echo "binary=$binary" >> $GITHUB_OUTPUT
+          formula="${{ inputs.formula-name || inputs.binary-name || github.event.repository.name }}"
+          echo "formula=$formula" >> $GITHUB_OUTPUT
+
+      - name: Wait for release assets
+        run: sleep 10
+
+      - name: Download release assets and calculate SHA256
+        id: sha
+        run: |
+          mkdir -p assets
+          binary="${{ steps.meta.outputs.binary }}"
+          version="${{ steps.meta.outputs.version }}"
+          repo="${{ github.repository }}"
+
+          for system in aarch64-darwin x86_64-darwin x86_64-linux; do
+            key=$(echo "$system" | tr '-' '_')
+            curl -L -o "assets/$system.tar.gz" \
+              "https://github.com/$repo/releases/download/v$version/$binary-$system.tar.gz"
+            sha=$(sha256sum "assets/$system.tar.gz" | cut -d' ' -f1)
+            echo "sha256_$key=$sha" >> $GITHUB_OUTPUT
+          done
+
+      - name: Generate Homebrew formula
+        run: |
+          binary="${{ steps.meta.outputs.binary }}"
+          formula="${{ steps.meta.outputs.formula }}"
+          version="${{ steps.meta.outputs.version }}"
+          repo="${{ github.repository }}"
+          desc="${{ inputs.description }}"
+
+          # Convert formula name to Ruby class name (kebab-case to PascalCase)
+          class_name=$(echo "$formula" | sed -r 's/(^|-)(\w)/\U\2/g')
+
+          mkdir -p Formula
+          cat > "Formula/$formula.rb" << EOF
+          class $class_name < Formula
+            desc "$desc"
+            homepage "https://github.com/$repo"
+            version "$version"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/$repo/releases/download/v$version/$binary-aarch64-darwin.tar.gz"
+                sha256 "${{ steps.sha.outputs.sha256_aarch64_darwin }}"
+              end
+              on_intel do
+                url "https://github.com/$repo/releases/download/v$version/$binary-x86_64-darwin.tar.gz"
+                sha256 "${{ steps.sha.outputs.sha256_x86_64_darwin }}"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "https://github.com/$repo/releases/download/v$version/$binary-x86_64-linux.tar.gz"
+                sha256 "${{ steps.sha.outputs.sha256_x86_64_linux }}"
+              end
+            end
+
+            def install
+              bin.install "$binary"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/$binary --version", 2)
+            end
+          end
+          EOF
+
+      - name: Push to Homebrew tap
+        uses: cpina/github-action-push-to-another-repository@main
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        with:
+          source-directory: Formula
+          destination-github-username: ${{ github.repository_owner }}
+          destination-repository-name: ${{ inputs.tap-repo }}
+          target-branch: main
+          target-directory: Formula
+          commit-message: "${{ steps.meta.outputs.formula }} ${{ steps.meta.outputs.version }}"
+          user-email: github-actions[bot]@users.noreply.github.com
+          user-name: github-actions[bot]
+          create-target-branch-if-needed: true
