@@ -25,6 +25,15 @@ jobs:
       - name: Build
         run: nix build
 
+      - name: Verify no nix store dependencies
+        if: runner.os == 'macOS'
+        run: |
+          if otool -L result/bin/* | grep -q /nix/store; then
+            echo "ERROR: binary has nix store dependencies"
+            otool -L result/bin/*
+            exit 1
+          fi
+
       - name: Package tarball
         run: |
           name="${{ github.event.repository.name }}"
