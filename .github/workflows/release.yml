@@ -2,11 +2,6 @@ name: Nix Flake Release
 
 on:
   workflow_call:
-    inputs:
-      binary-name:
-        description: "Name of the binary (defaults to repo name)"
-        required: false
-        type: string
 
 jobs:
   build:
@@ -28,12 +23,12 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Build
-        run: nix build .#packages.${{ matrix.system }}.default
+        run: nix build
 
       - name: Package tarball
         run: |
-          binary="${{ inputs.binary-name || github.event.repository.name }}"
-          tar -czvf "$binary-${{ matrix.system }}.tar.gz" -C result/bin .
+          name="${{ github.event.repository.name }}"
+          tar -czvf "$name-${{ matrix.system }}.tar.gz" -C result/bin .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
